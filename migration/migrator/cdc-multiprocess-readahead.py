@@ -219,6 +219,7 @@ def change_stream_processor(threadnum, appConfig, perfQ):
 
     printedFirstTs = False
     myCollectionOps = 0
+    resumeToken = None
 
     # starting timestamp
     endTs = appConfig["startTs"]
@@ -235,50 +236,35 @@ def change_stream_processor(threadnum, appConfig, perfQ):
             logIt(threadnum,"Creating change stream cursor for timestamp {}".format(endTs.as_datetime()))
 
     while not allDone:
-        for change in stream:
-            # check if time to exit
-            if ((time.time() - startTime) > appConfig['durationSeconds']) and (appConfig['durationSeconds'] != 0):
-                allDone = True
-                break
+        try:
+            for change in stream:
+                # check if time to exit
+                if ((time.time() - startTime) > appConfig['durationSeconds']) and (appConfig['durationSeconds'] != 0):
+                    allDone = True
+                    break
 
-            endTs = change['clusterTime']
-            resumeToken = change['_id']['_data']
-            thisNs = change['ns']['db']+'.'+change['ns']['coll']
-            thisOp = change['operationType']
+                thisNs = change['ns']['db']+'.'+change['ns']['coll']
+                thisOp = change['operationType']
 
-            # NOTE: Python's non-deterministic hash() cannot be used as it is seeded at startup, since this code is multiprocessing we need all hash calls to be the same between processes
-            #   hash(str(doc['o']['_id']))
-            #if ((thisOp in ['insert','update','replace','delete']) and
-            #     (thisNs == appConfig["sourceNs"]) and
-            if ((int(hashlib.sha512(str(change['documentKey']).encode('utf-8')).hexdigest(), 16) % appConfig["numProcessingThreads"]) == threadnum):
-                # this is for my thread
+                # NOTE: Python's non-deterministic hash() cannot be used as it is seeded at startup, since this code is multiprocessing we need all hash calls to be the same between processes
+                #   hash(str(doc['o']['_id']))
+                #if ((thisOp in ['insert','update','replace','delete']) and
+                #     (thisNs == appConfig["sourceNs"]) and
+                if ((int(hashlib.sha512(str(change['documentKey']).encode('utf-8')).hexdigest(), 16) % appConfig["numProcessingThreads"]) == threadnum):
+                    # this is for my thread
 
-                threadOplogEntries += 1
+                    threadOplogEntries += 1
 
-                if (not printedFirstTs) and (thisOp in ['insert','update','replace','delete']) and (thisNs == appConfig["sourceNs"]):
-                    if appConfig['verboseLogging']:
-                        logIt(threadnum,'first timestamp = {} aka {}'.format(change['clusterTime'],change['clusterTime'].as_datetime()))
-                    printedFirstTs = True
+                    if (not printedFirstTs) and (thisOp in ['insert','update','replace','delete']) and (thisNs == appConfig["sourceNs"]):
+                        if appConfig['verboseLogging']:
+                            logIt(threadnum,'first timestamp = {} aka {}'.format(change['clusterTime'],change['clusterTime'].as_datetime()))
+                        printedFirstTs = True
 
-                if (thisOp == 'insert'):
-                    # insert
-                    if (thisNs == appConfig["sourceNs"]):
-                        myCollectionOps += 1
-                        bulkOpList.append(pymongo.InsertOne(change['fullDocument']))
-                        # if playing old oplog, need to change inserts to be replaces (the inserts will fail due to _id uniqueness)
-                        #bulkOpListReplace.append(pymongo.ReplaceOne({'_id':change['documentKey']},change['fullDocument'],upsert=True))
-                        bulkOpListReplace.append(pymongo.ReplaceOne(change['documentKey'],change['fullDocument'],upsert=True))
-                        numCurrentBulkOps += 1
-                    else:
-                        pass
-
-                elif (thisOp in ['update','replace']):
-                    # update/replace
-                    if (change['fullDocument'] is not None):
+                    if (thisOp == 'insert'):
+                        # insert
                         if (thisNs == appConfig["sourceNs"]):
                             myCollectionOps += 1
-                            #bulkOpList.append(pymongo.ReplaceOne({'_id':change['documentKey']},change['fullDocument'],upsert=True))
-                            bulkOpList.append(pymongo.ReplaceOne(change['documentKey'],change['fullDocument'],upsert=True))
+                            bulkOpList.append(pymongo.InsertOne(change['fullDocument']))
                             # if playing old oplog, need to change inserts to be replaces (the inserts will fail due to _id uniqueness)
                             #bulkOpListReplace.append(pymongo.ReplaceOne({'_id':change['documentKey']},change['fullDocument'],upsert=True))
                             bulkOpListReplace.append(pymongo.ReplaceOne(change['documentKey'],change['fullDocument'],upsert=True))
@@ -286,47 +272,80 @@ def change_stream_processor(threadnum, appConfig, perfQ):
                         else:
                             pass
 
-                elif (thisOp == 'delete'):
-                    # delete
-                    if (thisNs == appConfig["sourceNs"]):
-                        myCollectionOps += 1
-                        bulkOpList.append(pymongo.DeleteOne({'_id':change['documentKey']['_id']}))
-                        # if playing old oplog, need to change inserts to be replaces (the inserts will fail due to _id uniqueness)
-                        bulkOpListReplace.append(pymongo.DeleteOne({'_id':change['documentKey']['_id']}))
-                        numCurrentBulkOps += 1
-                    else:
+                    elif (thisOp in ['update','replace']):
+                        # update/replace
+                        if (change['fullDocument'] is not None):
+                            if (thisNs == appConfig["sourceNs"]):
+                                myCollectionOps += 1
+                                #bulkOpList.append(pymongo.ReplaceOne({'_id':change['documentKey']},change['fullDocument'],upsert=True))
+                                bulkOpList.append(pymongo.ReplaceOne(change['documentKey'],change['fullDocument'],upsert=True))
+                                # if playing old oplog, need to change inserts to be replaces (the inserts will fail due to _id uniqueness)
+                                #bulkOpListReplace.append(pymongo.ReplaceOne({'_id':change['documentKey']},change['fullDocument'],upsert=True))
+                                bulkOpListReplace.append(pymongo.ReplaceOne(change['documentKey'],change['fullDocument'],upsert=True))
+                                numCurrentBulkOps += 1
+                            else:
+                                pass
+
+                    elif (thisOp == 'delete'):
+                        # delete
+                        if (thisNs == appConfig["sourceNs"]):
+                            myCollectionOps += 1
+                            bulkOpList.append(pymongo.DeleteOne({'_id':change['documentKey']['_id']}))
+                            # if playing old oplog, need to change inserts to be replaces (the inserts will fail due to _id uniqueness)
+                            bulkOpListReplace.append(pymongo.DeleteOne({'_id':change['documentKey']['_id']}))
+                            numCurrentBulkOps += 1
+                        else:
+                            pass
+
+                    elif (thisOp in ['drop','rename','dropDatabase','invalidate']):
+                        # operations we do not track
                         pass
 
-                elif (thisOp in ['drop','rename','dropDatabase','invalidate']):
-                    # operations we do not track
-                    pass
+                    else:
+                        print(change)
+                        sys.exit(1)
 
-                else:
-                    print(change)
-                    sys.exit(1)
+                if ((numCurrentBulkOps >= appConfig["maxOperationsPerBatch"]) or (time.time() >= (lastBatch + appConfig["maxSecondsBetweenBatches"]))) and (numCurrentBulkOps > 0):
+                    if not appConfig['dryRun']:
+                        try:
+                            result = destCollection.bulk_write(bulkOpList,ordered=True)
+                        except:
+                            # replace inserts as replaces
+                            result = destCollection.bulk_write(bulkOpListReplace,ordered=True)
 
-            if time.time() > nextPerfReportTime:
-                nextPerfReportTime = time.time() + perfReportInterval
-                perfQ.put({"name":"batchCompleted","operations":numReportBulkOps,"endts":endTs,"processNum":threadnum,"resumeToken":resumeToken})
-                numReportBulkOps = 0
+                    endTs = change['clusterTime']
+                    resumeToken = change['_id']['_data']
+                
+                    bulkOpList = []
+                    bulkOpListReplace = []
+                    numReportBulkOps += numCurrentBulkOps
+                    numCurrentBulkOps = 0
+                    numTotalBatches += 1
+                    lastBatch = time.time()
+                
+                if time.time() > nextPerfReportTime:
+                    nextPerfReportTime = time.time() + perfReportInterval
+                    perfQ.put({"name":"batchCompleted","operations":numReportBulkOps,"endts":endTs,"processNum":threadnum,"resumeToken":resumeToken})
+                    numReportBulkOps = 0
 
-            if ((numCurrentBulkOps >= appConfig["maxOperationsPerBatch"]) or (time.time() >= (lastBatch + appConfig["maxSecondsBetweenBatches"]))) and (numCurrentBulkOps > 0):
-                if not appConfig['dryRun']:
-                    try:
-                        result = destCollection.bulk_write(bulkOpList,ordered=True)
-                    except:
-                        # replace inserts as replaces
-                        result = destCollection.bulk_write(bulkOpListReplace,ordered=True)
 
-                bulkOpList = []
-                bulkOpListReplace = []
-                numReportBulkOps += numCurrentBulkOps
-                numCurrentBulkOps = 0
-                numTotalBatches += 1
-                lastBatch = time.time()
+                # nothing arrived in the oplog for 1 second, pause before trying again
+                #time.sleep(1)
+        except Exception as e:
+            logIt(threadnum,"Worker | Error ecountered {}".format(e))
+            try:
+                stream.close()
+            except Exception as e:
+                pass
+            
+            if(not resumeToken):
+                logIt(threadnum,"Worker | Cannot resume after error.")    
+                sys.exit(1)
 
-            # nothing arrived in the oplog for 1 second, pause before trying again
-            #time.sleep(1)
+            # repoen the stream where we left off
+            stream = sourceColl.watch(resume_after={'_data': resumeToken}, full_document='updateLookup', pipeline=[{'$match': {'operationType': {'$in': ['insert','update','replace','delete']}}},{'$project':{'updateDescription':0}}])
+            
+            pass    
 
     if (numCurrentBulkOps > 0):
         if not appConfig['dryRun']:
@@ -359,10 +378,8 @@ def readahead_worker(threadnum, appConfig, perfQ):
 
     numReadaheadWorkers = appConfig['numReadaheadWorkers']
     readaheadChunkSeconds = appConfig['readaheadChunkSeconds']
-    readaheadJumpSeconds = numReadaheadWorkers * readaheadChunkSeconds
-    readaheadTimeDelta = timedelta(seconds=readaheadJumpSeconds)
-
-    usableThreadNum = threadnum - appConfig['numProcessingThreads']
+    
+    threadId = threadnum - appConfig['numProcessingThreads']
 
     sourceConnection = pymongo.MongoClient(host=appConfig["sourceUri"],appname='migrcdc')
     sourceDb = sourceConnection[appConfig["sourceNs"].split('.',1)[0]]
@@ -386,36 +403,47 @@ def readahead_worker(threadnum, appConfig, perfQ):
     myCollectionOps = 0
 
     # starting timestamp
-    endTs = appConfig["startTs"]
+    initialStartTs = appConfig["startTs"].time + threadId * readaheadChunkSeconds
+    startTs = initialStartTs    
+    iterations = 0
 
     while not allDone:
-        endTs = Timestamp(endTs.time + (usableThreadNum * readaheadChunkSeconds), 0)
-        chunkStopTs = Timestamp(endTs.time + readaheadChunkSeconds, 4294967295)
-        #logIt(threadnum,"READAHEAD | starting at {}".format(endTs))
-
+        startTs = Timestamp(initialStartTs + iterations * (numReadaheadWorkers * readaheadChunkSeconds), 0)
+        chunkStopTs = Timestamp(startTs.time + readaheadChunkSeconds, 4294967295)
         if (appConfig["startTs"] == "RESUME_TOKEN"):
             stream = sourceColl.watch(resume_after={'_data': appConfig["startPosition"]}, full_document='updateLookup', pipeline=[{'$match': {'operationType': {'$in': ['insert','update','replace','delete']}}},{'$project':{'updateDescription':0,'fullDocument':0}}])
         else:
-            stream = sourceColl.watch(start_at_operation_time=endTs, full_document='updateLookup', pipeline=[{'$match': {'operationType': {'$in': ['insert','update','replace','delete']}}},{'$project':{'updateDescription':0,'fullDocument':0}}])
+            stream = sourceColl.watch(start_at_operation_time=startTs, full_document='updateLookup', pipeline=[{'$match': {'operationType': {'$in': ['insert','update','replace','delete']}}},{'$project':{'updateDescription':0,'fullDocument':0}}])
 
-        #if appConfig['verboseLogging']:
-        #    if (appConfig["startTs"] == "RESUME_TOKEN"):
-        #        logIt(threadnum,"READAHEAD | Creating change stream cursor for resume token {}".format(appConfig["startPosition"]))
-        #    else:
-        #        logIt(threadnum,"READAHEAD | Creating change stream cursor for timestamp {}".format(endTs.as_datetime()))
+
+        if appConfig['verboseLogging']:
+            if (appConfig["startTs"] == "RESUME_TOKEN"):
+                logIt(threadnum,"READAHEAD | Creating change stream cursor for resume token {}".format(appConfig["startPosition"]))
+            else:
+                logIt(threadnum,"READAHEAD | Creating change stream cursor for timestamp {}".format(startTs.as_datetime()))
 
         try:
-            with open(tempFileName, 'r') as f:
-                content = f.read()
-            dtUtcNow = datetime.utcnow()
-            applierSecondsBehind = int(content)
-            secondsBehind = int((dtUtcNow - endTs.as_datetime().replace(tzinfo=None)).total_seconds())
-            secondsAhead = applierSecondsBehind - secondsBehind
-            #logIt(threadnum,"READAHEAD | ahead of applier by {} seconds".format(secondsAhead))
-            if (secondsAhead > readaheadMaximumAhead):
-                sleepSeconds = secondsAhead - readaheadMaximumAhead
-                logIt(threadnum,"READAHEAD | ahead of applier by {} seconds, sleeping for {} seconds".format(secondsAhead,sleepSeconds))
-                time.sleep(sleepSeconds)
+            ii = 0
+            while True:
+                ii = ii + 1
+                with open(tempFileName, 'r') as f:
+                    content = f.read()
+                dtUtcNow = datetime.utcnow()
+                try:
+                    applierSecondsBehind = int(content)
+                except:
+                    logIt(threadnum, "READAHEAD | bad file: {}".format(content))
+                    break
+                secondsBehind = int((dtUtcNow - startTs.as_datetime().replace(tzinfo=None)).total_seconds())
+                secondsAhead = applierSecondsBehind - secondsBehind
+                if appConfig['verboseLogging']:
+                    logIt(threadnum,"READAHEAD | ahead of applier by {} seconds".format(secondsAhead))
+                if (secondsAhead > readaheadMaximumAhead):
+                    sleepSeconds = secondsAhead - readaheadMaximumAhead
+                    if appConfig['verboseLogging'] or ii == 1:
+                        logIt(threadnum,"READAHEAD | ahead of applier by {} seconds, sleeping for {} seconds, now: {}, applierBehind: {}, ourBehind: {}, secondsAhead : {}".format(secondsAhead,sleepSeconds, dtUtcNow, applierSecondsBehind, secondsBehind, secondsAhead))
+                    time.sleep(1)
+
         except FileNotFoundError:
             #logIt(threadnum,"READAHEAD | temp file {} not found".format(tempFileName))
             pass
@@ -423,75 +451,86 @@ def readahead_worker(threadnum, appConfig, perfQ):
             #logIt(threadnum,"READAHEAD | reading temp file {} exception".format(e))
             pass
 
-        for change in stream:
-            # check if time to exit
-            if ((time.time() - startTime) > appConfig['durationSeconds']) and (appConfig['durationSeconds'] != 0):
-                allDone = True
-                break
+        try:
+            for change in stream:
+                # check if time to exit
+                if ((time.time() - startTime) > appConfig['durationSeconds']) and (appConfig['durationSeconds'] != 0):
+                    allDone = True
+                    break
 
-            endTs = change['clusterTime']
-            resumeToken = change['_id']['_data']
-            thisNs = change['ns']['db']+'.'+change['ns']['coll']
-            thisOp = change['operationType']
+                thisNs = change['ns']['db']+'.'+change['ns']['coll']
+                thisOp = change['operationType']
 
-            # check if done with chunk
-            if (endTs > chunkStopTs):
-                #logIt(threadnum,"READAHEAD | Done with chunk")
+                # check if done with chunk
+                if (change['clusterTime'] > chunkStopTs):
+                    if appConfig['verboseLogging']:
+                        logIt(threadnum,"READAHEAD | Done with chunk")
+                    stream.close()
+                    break
+
+                threadOplogEntries += 1
+
+                if (not printedFirstTs) and (thisOp in ['insert','update','replace','delete']) and (thisNs == appConfig["sourceNs"]):
+                    if appConfig['verboseLogging']:
+                        logIt(threadnum,'READAHEAD | first timestamp = {} aka {}'.format(change['clusterTime'],change['clusterTime'].as_datetime()))
+                        pass
+                    printedFirstTs = True
+                
+                if threadOplogEntries % 1000 == 0 and appConfig['verboseLogging']:
+                    logIt(threadnum,'READAHEAD | timestamp = {} aka {}'.format(change['clusterTime'],change['clusterTime'].as_datetime()))
+
+                if (thisOp == 'insert'):
+                    # insert
+                    if (thisNs == appConfig["sourceNs"]):
+                        myCollectionOps += 1
+                        numCurrentBulkOps += 1
+                    else:
+                        pass
+
+                elif (thisOp in ['update','replace']):
+                    # update/replace
+                    if (thisNs == appConfig["sourceNs"]):
+                        myCollectionOps += 1
+                        numCurrentBulkOps += 1
+                    else:
+                        pass
+
+                elif (thisOp == 'delete'):
+                    # delete
+                    if (thisNs == appConfig["sourceNs"]):
+                        myCollectionOps += 1
+                        numCurrentBulkOps += 1
+                    else:
+                        pass
+
+                elif (thisOp in ['drop','rename','dropDatabase','invalidate']):
+                    # operations we do not track
+                    pass
+
+                else:
+                    print(change)
+                    sys.exit(1)
+
+                if time.time() > nextPerfReportTime:
+                    nextPerfReportTime = time.time() + perfReportInterval
+                    perfQ.put({"name":"readaheadBatchCompleted","operations":numReportBulkOps,"endts":startTs,"processNum":threadnum})
+                    numReportBulkOps = 0
+
+                numReportBulkOps += numCurrentBulkOps
+                numCurrentBulkOps = 0
+                numTotalBatches += 1
+                lastBatch = time.time()
+
+            # Successful iteration, Increment
+            iterations = iterations+1
+        except Exception as e:
+            try:
                 stream.close()
-                break
-
-            threadOplogEntries += 1
-
-            if (not printedFirstTs) and (thisOp in ['insert','update','replace','delete']) and (thisNs == appConfig["sourceNs"]):
-                if appConfig['verboseLogging']:
-                    #logIt(threadnum,'READAHEAD | first timestamp = {} aka {}'.format(change['clusterTime'],change['clusterTime'].as_datetime()))
-                    pass
-                printedFirstTs = True
-
-            if (thisOp == 'insert'):
-                # insert
-                if (thisNs == appConfig["sourceNs"]):
-                    myCollectionOps += 1
-                    numCurrentBulkOps += 1
-                else:
-                    pass
-
-            elif (thisOp in ['update','replace']):
-                # update/replace
-                if (thisNs == appConfig["sourceNs"]):
-                    myCollectionOps += 1
-                    numCurrentBulkOps += 1
-                else:
-                    pass
-
-            elif (thisOp == 'delete'):
-                # delete
-                if (thisNs == appConfig["sourceNs"]):
-                    myCollectionOps += 1
-                    numCurrentBulkOps += 1
-                else:
-                    pass
-
-            elif (thisOp in ['drop','rename','dropDatabase','invalidate']):
-                # operations we do not track
+            except:
                 pass
-
-            else:
-                print(change)
-                sys.exit(1)
-
-            if time.time() > nextPerfReportTime:
-                nextPerfReportTime = time.time() + perfReportInterval
-                perfQ.put({"name":"readaheadBatchCompleted","operations":numReportBulkOps,"endts":endTs,"processNum":threadnum})
-                numReportBulkOps = 0
-
-            numReportBulkOps += numCurrentBulkOps
-            numCurrentBulkOps = 0
-            numTotalBatches += 1
-            lastBatch = time.time()
-
+            logIt(threadnum,"READAHEAD | Error ecountered {}".format(e))
+            time.sleep(5)
             # nothing arrived in the oplog for 1 second, pause before trying again
-            #time.sleep(1)
 
         #perfQ.put({"name":"readaheadBatchCompleted","operations":numCurrentBulkOps,"endts":endTs,"processNum":threadnum})
 
